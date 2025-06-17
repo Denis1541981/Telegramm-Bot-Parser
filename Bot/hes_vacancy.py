@@ -37,8 +37,8 @@ class Hash_Vacancy:
         self.save_new_vacancies(new_vacancies)
         return new_vacancies
 
-
-    def save_new_vacancies(self, new_vacancies):
+    @staticmethod
+    def save_new_vacancies(new_vacancies):
         """Сохраняет новые вакансии для рассылки"""
         if not new_vacancies:
             return False
