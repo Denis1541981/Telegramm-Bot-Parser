@@ -1,40 +1,44 @@
 import asyncio
 import logging
+import os
 import sqlite3
 from datetime import datetime
-from dotenv import load_dotenv, find_dotenv
-import os
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (InlineKeyboardButton, KeyboardButton, Message,
+                           ReplyKeyboardMarkup, InlineKeyboardMarkup)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from dotenv import load_dotenv, find_dotenv
 
-from Bot.hes_vacancy import Hash_Vacancy
-from Bot.parser_hh import ZarplataParser
+import hh_ru
+import re
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("vacancy_bot.log"),
+        logging.FileHandler("vacancy_bot.log", "a", encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
 load_dotenv(find_dotenv('.env'))
-token = os.getenv("TOKEN")
-
-bot = Bot(token)
+bot = Bot(os.getenv("TOKEN"))
 dp = Dispatcher()
+
+# Кеш для хранения последних вакансий
+vacancies_cache: Dict[int, Dict] = {}
 
 
 # Инициализация SQLite
 def init_db():
-    with sqlite3.connect('vacancy_bot.db') as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
+    with sqlite3.connect('vacancy_bot.db', check_same_thread=False) as conn:
+        conn.execute('''
             CREATE TABLE IF NOT EXISTS subscribers (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
@@ -48,9 +52,8 @@ def init_db():
 init_db()
 
 
-# Клавиатура с основными командами
-def get_main_keyboard():
-    keyboard = ReplyKeyboardMarkup(
+def get_main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="/help"), KeyboardButton(text="/subscribe")],
             [KeyboardButton(text="/unsubscribe"), KeyboardButton(text="/latest")],
@@ -58,43 +61,116 @@ def get_main_keyboard():
         ],
         resize_keyboard=True
     )
-    return keyboard
 
 
-# Клавиатура пагинации
-def get_pagination_keyboard(page: int, total_pages: int, prefix: str):
+def get_pagination_keyboard(page: int, total_pages: int, prefix: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-
     if page > 1:
         builder.add(InlineKeyboardButton(
             text="⬅️ Назад",
             callback_data=f"{prefix}_prev_{page - 1}"
         ))
-
     builder.add(InlineKeyboardButton(
         text=f"{page}/{total_pages}",
         callback_data="current_page"
     ))
-
     if page < total_pages:
         builder.add(InlineKeyboardButton(
             text="Вперёд ➡️",
             callback_data=f"{prefix}_next_{page + 1}"
         ))
-
     return builder.as_markup()
 
 
-# Форматирование вакансии
-def format_vacancy(vacancy):
-    return (f"🏢 {vacancy.get('company', 'Не указано')}\n"
-            f"🔹 {vacancy.get('title', 'Без названия')}\n"
-            f"💵 {vacancy.get('salary', 'З/п не указана')}\n"
-            f"📍 {vacancy.get('location', 'Локация не указана')}\n"
-            f"🔗 {vacancy.get('link', '#')}")
+def format_vacancy(vacancies_dict: Dict) -> str:
+    """
+    Форматирует словарь вакансий для вывода
+    с защитой от всех типов ошибок форматирования
+
+    :param vacancies_dict: Словарь в формате {id: vacancy_data}
+    :return: Отформатированная строка с вакансиями
+    """
+    if not vacancies_dict:
+        return "Новых вакансий не найдено"
+
+    result = []
+
+    for vacancy_data in vacancies_dict.values():
+        try:
+            # Безопасное получение и форматирование зарплаты
+            salary = vacancy_data.get('salary_from')
+
+            if salary is None:
+                cleaned_salary = 'З/п не указана'
+            elif isinstance(salary, (int, float)):
+                # Форматируем числовую зарплату
+                cleaned_salary = f"{int(salary):,} ₽".replace(',', ' ')
+            else:
+                # Обрабатываем строковую зарплату
+                cleaned_salary = re.sub(r'\u202f|\xa0', ' ', str(salary)).strip()
+
+            # Безопасное получение остальных полей
+            employer = str(vacancy_data.get('employer_name', 'Не указано'))
+            position = str(vacancy_data.get('vacancy_name', 'Без названия'))
+            address = str(vacancy_data.get('address', 'Локация не указана'))
+            url = str(vacancy_data.get('vacancy_url', '#'))
+
+            vacancy_str = (
+                f"🏢 {employer}\n"
+                f"🔹 {position}\n"
+                f"💵 {cleaned_salary}\n"
+                f"📍 {address}\n"
+                f"🔗 {url}\n"
+            )
+            result.append(vacancy_str)
+
+        except Exception as e:
+            logger.error(f"Ошибка форматирования вакансии: {e}")
+            continue
+
+    return "\n".join(result) if result else "Нет вакансий для отображения"
 
 
-# ========== Обработчики команд ==========
+async def get_user_filters(user_id: int) -> List[str]:
+    with sqlite3.connect('vacancy_bot.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT filters FROM subscribers WHERE user_id = ?',
+            (user_id,)
+        )
+        result = cursor.fetchone()
+    return [f.strip().lower() for f in result[0].split(',')] if result and result[0] else []
+
+
+async def filter_vacancies(vacancies: Dict, filters: List[str]) -> Dict:
+    if not filters:
+        return vacancies
+
+    filtered = {}
+    for vacancy_id, vacancy_data in vacancies.items():
+        vacancy_text = " ".join(str(v) for v in vacancy_data.values()).lower()
+        if any(keyword in vacancy_text for keyword in filters):
+            filtered[vacancy_id] = vacancy_data
+    return filtered
+
+
+async def get_new_vacancies(per_page=10, page=0, text=''):
+    """Получение только новых вакансий с полной обработкой ошибок"""
+    try:
+        # Получаем и парсим данные
+        parsed_data = pd.DataFrame(hh_ru.parse_json(hh_ru.get_requests(per_page=per_page, page=page, text=text)))
+        parsed_data.set_index('vacancy_id', inplace=True)
+
+        # Обновляем хранилище
+        new_vacancies = hh_ru.update_vacancy(parsed_data)
+        return new_vacancies
+
+    except Exception as e:
+        logger.error(f"get_new_vacancies error: {e}")
+        return []
+
+
+# Обработчики команд
 @dp.message(CommandStart())
 async def process_start_command(message: Message):
     logger.info(f"User {message.from_user.id} started the bot")
@@ -122,6 +198,28 @@ async def process_help_command(message: Message):
     )
 
 
+@dp.message(Command(commands='latest'))
+async def send_latest_vacancies(message: Message):
+    user_id = message.from_user.id
+    await message.answer("⏳ Ищу последние вакансии...")
+
+    try:
+        new_vacancies = await get_new_vacancies()
+        if not new_vacancies:
+            await message.answer("Новых вакансий не найдено.")
+            return
+
+        filters = await get_user_filters(user_id)
+        filtered_vacancies = await filter_vacancies(new_vacancies, filters)
+
+        formatted = format_vacancy(filtered_vacancies)
+        await message.answer(formatted if formatted else "Нет вакансий по вашему фильтру.")
+
+    except Exception as e:
+        logger.error(f"Error getting vacancies for {user_id}: {e}")
+        await message.answer("⚠️ Произошла ошибка при обработке вакансий")
+
+
 @dp.message(Command(commands='subscribe'))
 async def subscribe_user(message: Message):
     user_id = message.from_user.id
@@ -129,19 +227,25 @@ async def subscribe_user(message: Message):
 
     with sqlite3.connect('vacancy_bot.db') as conn:
         cursor = conn.cursor()
+        # Проверяем, не подписан ли уже пользователь
         cursor.execute('SELECT 1 FROM subscribers WHERE user_id = ?', (user_id,))
-        exists = cursor.fetchone()
+        if cursor.fetchone():
+            await message.answer("Вы уже подписаны на рассылку вакансий.")
+            return
 
-        if not exists:
-            cursor.execute(
-                'INSERT INTO subscribers (user_id, username, subscribed_at) VALUES (?, ?, ?)',
-                (user_id, username, datetime.now())
-            )
-            conn.commit()
-            logger.info(f"User {user_id} subscribed")
-            await message.answer("✅ Вы подписались на рассылку новых вакансий!")
-        else:
-            await message.answer("ℹ️ Вы уже подписаны на рассылку.")
+        # Добавляем нового подписчика
+        cursor.execute(
+            'INSERT INTO subscribers (user_id, username, subscribed_at) VALUES (?, ?, ?)',
+            (user_id, username, datetime.now())
+        )
+        conn.commit()
+
+    await message.answer(
+        "✅ Вы успешно подписались на рассылку новых вакансий!\n"
+        "Используйте /set_filters чтобы настроить фильтры по ключевым словам.",
+        reply_markup=get_main_keyboard()
+    )
+    logger.info(f"User {user_id} subscribed to vacancies")
 
 
 @dp.message(Command(commands='unsubscribe'))
@@ -153,142 +257,14 @@ async def unsubscribe_user(message: Message):
         cursor.execute('DELETE FROM subscribers WHERE user_id = ?', (user_id,))
         conn.commit()
 
-        if cursor.rowcount > 0:
-            logger.info(f"User {user_id} unsubscribed")
-            await message.answer("❌ Вы отписались от рассылки.")
-        else:
-            await message.answer("ℹ️ Вы не были подписаны на рассылку.")
-
-
-@dp.message(Command(commands='set_filters'))
-async def set_filters_command(message: Message):
-    await message.answer(
-        "Введите ключевые слова для фильтрации вакансий (через запятую):\n"
-        "Пример: Python, Django, удалёнка"
-    )
-
-
-@dp.message(F.text & ~F.text.startswith('/'))
-async def process_filters(message: Message):
-    user_id = message.from_user.id
-    filters = message.text.strip()
-
-    with sqlite3.connect('vacancy_bot.db') as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            'UPDATE subscribers SET filters = ? WHERE user_id = ?',
-            (filters, user_id)
+    if cursor.rowcount > 0:
+        await message.answer(
+            "Вы отписались от рассылки вакансий.",
+            reply_markup=get_main_keyboard()
         )
-        conn.commit()
-
-    logger.info(f"User {user_id} set filters: {filters}")
-    await message.answer(f"✅ Фильтры обновлены: {filters}")
-
-
-@dp.message(Command(commands='my_filters'))
-async def show_filters(message: Message):
-    user_id = message.from_user.id
-
-    with sqlite3.connect('vacancy_bot.db') as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            'SELECT filters FROM subscribers WHERE user_id = ?',
-            (user_id,)
-        )
-        result = cursor.fetchone()
-
-    filters = result[0] if result and result[0] else "не установлены"
-    await message.answer(f"Ваши текущие фильтры: {filters}")
-
-
-# Глобальная переменная для хранения вакансий между запросами
-user_vacancies = {}
-
-
-@dp.message(Command(commands='latest'))
-async def send_latest_vacancies(message: Message):
-    user_id = message.from_user.id
-    await message.answer("⏳ Ищу последние вакансии...")
-
-    try:
-        # Получаем фильтры пользователя
-        with sqlite3.connect('vacancy_bot.db') as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'SELECT filters FROM subscribers WHERE user_id = ?',
-                (user_id,)
-            )
-            result = cursor.fetchone()
-            filters = result[0].split(',') if result and result[0] else None
-
-        # Получаем и фильтруем вакансии
-        filtered_vacancies = []
-        async for vacancies in ZarplataParser.get_vacancies():
-            hasher = Hash_Vacancy(vacancies)
-            added = hasher.process()
-
-            if added:
-                if filters:
-                    for vacancy in added:
-                        if any(keyword.lower() in vacancy.get('title', '').lower() or
-                               keyword.lower() in vacancy.get('description', '').lower()
-                               for keyword in filters):
-                            filtered_vacancies.append(vacancy)
-                else:
-                    filtered_vacancies.extend(added)
-
-        if filtered_vacancies:
-            # Сохраняем вакансии для пагинации
-            user_vacancies[user_id] = filtered_vacancies
-            total_pages = len(filtered_vacancies) // 5 + 1
-
-            # Отправляем первую страницу
-            await send_vacancy_page(user_id, message.chat.id, 1)
-
-        else:
-            await message.answer("Новых вакансий по вашим фильтрам не найдено.")
-
-    except Exception as e:
-        logger.error(f"Error getting vacancies for {user_id}: {str(e)}")
-        await message.answer(f"⚠️ Ошибка при получении вакансий: {str(e)}")
-
-
-async def send_vacancy_page(user_id: int, chat_id: int, page: int):
-    vacancies = user_vacancies.get(user_id, [])
-    if not vacancies:
-        await bot.send_message(chat_id, "Вакансии не найдены.")
-        return
-
-    total_pages = (len(vacancies) // 5) + 1
-    page = max(1, min(page, total_pages))
-    start_idx = (page - 1) * 5
-    end_idx = start_idx + 5
-
-    for vacancy in vacancies[start_idx:end_idx]:
-        await bot.send_message(chat_id, format_vacancy(vacancy))
-
-    if len(vacancies) > 5:
-        await bot.send_message(
-            chat_id,
-            f"Страница {page} из {total_pages}",
-            reply_markup=get_pagination_keyboard(page, total_pages, "vacancy")
-        )
-
-
-@dp.callback_query(F.data.startswith("vacancy_"))
-async def handle_pagination(callback_query):
-    data = callback_query.data
-    user_id = callback_query.from_user.id
-    chat_id = callback_query.message.chat.id
-
-    if data.startswith("vacancy_prev_"):
-        page = int(data.split("_")[2])
-        await send_vacancy_page(user_id, chat_id, page)
-    elif data.startswith("vacancy_next_"):
-        page = int(data.split("_")[2])
-        await send_vacancy_page(user_id, chat_id, page)
-
-    await callback_query.answer()
+        logger.info(f"User {user_id} unsubscribed from vacancies")
+    else:
+        await message.answer("Вы не были подписаны на рассылку.")
 
 
 async def check_new_vacancies():
@@ -296,62 +272,40 @@ async def check_new_vacancies():
     while True:
         try:
             logger.info("Checking for new vacancies...")
+            new_vacancies = await get_new_vacancies()
 
-            # Получаем всех подписчиков с их фильтрами
+            if not new_vacancies:
+                await asyncio.sleep(60 * 30)
+                continue
+
             with sqlite3.connect('vacancy_bot.db') as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT user_id, filters FROM subscribers')
                 subscribers = cursor.fetchall()
 
-            if not subscribers:
-                await asyncio.sleep(60 * 30)
-                continue
+            for user_id, filters in subscribers:
+                try:
+                    filters_list = [f.strip().lower() for f in filters.split(',')] if filters else []
+                    filtered = await filter_vacancies(new_vacancies, filters_list)
 
-            # Получаем новые вакансии
-            async for vacancies in ZarplataParser.get_vacancies():
-                hasher = Hash_Vacancy(vacancies)
-                added = hasher.process()
+                    if filtered:
+                        await bot.send_message(
+                            user_id,
+                            "Новые вакансии:\n" + format_vacancy(filtered)
+                        )
+                        await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"Error sending to user {user_id}: {str(e)}")
 
-                if not added:
-                    continue
-
-                # Рассылаем каждому подписчику с учетом его фильтров
-                for user_id, filters in subscribers:
-                    filters_list = filters.split(',') if filters else None
-                    sent_count = 0
-
-                    for vacancy in added:
-                        # Проверяем фильтры
-                        if filters_list:
-                            if not any(keyword.lower() in vacancy.get('title', '').lower() or
-                                       keyword.lower() in vacancy.get('description', '').lower()
-                                       for keyword in filters_list):
-                                continue
-
-                        try:
-                            await bot.send_message(user_id, format_vacancy(vacancy))
-                            sent_count += 1
-                            await asyncio.sleep(0.1)  # Anti-flood
-
-                            if sent_count >= 10:  # Лимит на одну рассылку
-                                break
-
-                        except Exception as e:
-                            logger.error(f"Can't send to {user_id}: {e}")
-                            break  # Прекращаем если пользователь заблокировал бота
-
-            await asyncio.sleep(60 * 30)  # Проверяем каждые 30 минут
+            await asyncio.sleep(60 * 30)
 
         except Exception as e:
-            logger.error(f"Error in check_new_vacancies: {e}")
-            await asyncio.sleep(60 * 5)  # При ошибке ждем 5 минут
+            logger.error(f"Error in check_new_vacancies: {str(e)}")
+            await asyncio.sleep(60 * 5)
 
 
 async def main():
-    # Запускаем фоновую задачу проверки вакансий
     asyncio.create_task(check_new_vacancies())
-
-    # Запускаем бота
     logger.info("Starting bot...")
     await dp.start_polling(bot)
 
