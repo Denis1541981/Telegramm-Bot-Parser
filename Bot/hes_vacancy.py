@@ -24,17 +24,31 @@ class Hash_Vacancy:
         """Загружает существующие данные из файла"""
         file_path = "Vacancy.json"
 
-        try:
-            if os.path.exists(file_path):
-                with open(file_path, "r", encoding='utf-8') as file:
-                    return json.load(file)
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"Error loading existing data: {e}")
+        if not os.path.exists(file_path):
+            # Файл не существует - создаём пустой
+            cls._save_data(file_path, {})
+            return {}
 
-        # Если файла нет или произошла ошибка
+        try:
+            with open(file_path, "r", encoding='utf-8') as file:
+                return json.load(file)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error loading existing data (corrupted file): {e}")
+            # Создаём резервную копию
+            backup_path = f"{file_path}.backup"
+            try:
+                os.rename(file_path, backup_path)
+                logger.info(f"Created backup: {backup_path}")
+            except OSError:
+                pass
+            cls._save_data(file_path, {})
+            return {}
+
+    @staticmethod
+    def _save_data(file_path: str, data: Dict) -> None:
+        """Сохраняет данные в файл"""
         with open(file_path, "w", encoding='utf-8') as file:
-            json.dump({}, file)
-        return {}
+            json.dump(data, file, indent=4, ensure_ascii=False)
 
     def filter_new_vacancies(self):
         """Фильтрует вакансии, оставляя только новые"""
@@ -44,16 +58,13 @@ class Hash_Vacancy:
         return self.new_vacancies
 
 
-    def save_new_update_vacancies(self):
-        """Сохраняет новые вакансии и объединяет их с главным файлом, чтобы исключить дублирования объявлений в рассылке"""
+    def save_new_update_vacancies(self) -> bool:
+        """Сохраняет новые вакансии и объединяет их с главным файлом"""
         if not self.new_vacancies:
             return False
 
-        # Объединяем старые и новые данные
         updated_data = {**self.existing_data, **self.new_vacancies}
-
-        with open("Vacancy.json", "w") as f:
-            json.dump(updated_data, f, indent=4, ensure_ascii=False)
+        self._save_data("Vacancy.json", updated_data)
         return True
 
 

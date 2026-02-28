@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 import re
-from typing import Dict, AsyncGenerator, Any, Coroutine
+from typing import Dict, AsyncGenerator, Optional
 
 from aiohttp import ClientSession
 from bs4 import BeautifulSoup
@@ -10,93 +12,94 @@ from hes_vacancy import Hash_Vacancy
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.ERROR,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 
-
-def cleaner_str(string: str):
-
-    cleaned_salary = re.sub(r'\xa0|\u202f|', ' ', string).strip()
-    return cleaned_salary
+def cleaner_str(string: str) -> str:
+    """Очищает строку от неразрывных пробелов"""
+    return re.sub(r'[\xa0\u202f]', ' ', string).strip()
 
 
 class ZarplataParser:
+    """Парсер вакансий с Zarplata.ru"""
+
     HEADERS = {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
     }
 
-    BASE_PARAMS = {
-        'text': '',
-        'excluded_text': '',
-        'area': '1204',
-        'salary': '',
-        'currency_code': 'RUR',
-        'experience': 'doesNotMatter',
-        'employment': [
-            'full',
-            'part',
-        ],
-        'schedule': [
-            'fullDay',
-            'shift',
-            'flexible',
-            'remote',
-            'flyInFlyOut',
-        ],
-        'order_by': 'relevance',
-        'search_period': '0',
-        'items_on_page': '100',
-        'L_save_area': 'true',
-        'hhtmFrom': 'vacancy_search_filter',
+    # Устойчивые CSS-селекторы (без хэшей классов)
+    SELECTORS = {
+        'item': 'div[class*="vacancy"]',
+        'title': 'span[class*="title"], h3[class*="title"], a[class*="title"]',
+        'salary': 'span[class*="salary"], p[class*="salary"]',
+        'company': 'span[class*="company"], a[class*="company"]',
+        'city': 'span[class*="city"], [class*="address"]',
+        'link': 'a[href*="/vacancy/"]',
     }
 
-    @staticmethod
-    async def fetch_page(session: ClientSession, url: str, params: Dict) -> str | None:
+    def __init__(self, city: str = 'berdsk', pages: int = 1):
+        self.city = city
+        self.pages = pages
+        self.base_url = f'https://{city}.zarplata.ru/search/vacancy'
+        self.base_params = {
+            'text': '',
+            'area': '1204',  # Новосибирская обл.
+            'items_on_page': '100',
+        }
+
+    async def fetch_page(self, session: ClientSession, page: int) -> Optional[str]:
         """Выполняет асинхронный запрос к странице"""
+        params = self.base_params.copy()
+        params['page'] = page
+
         try:
-            async with session.get(url, headers=ZarplataParser.HEADERS, params=params) as response:
+            async with session.get(self.base_url, headers=self.HEADERS, params=params) as response:
                 if response.status == 200:
-                    logger.info(f"Successful request to {url} with params {params}")
+                    logger.info(f"Request successful: page {page}")
                     return await response.text()
-                logger.error(f"Error: status {response.status} for page {params.get('page')}")
+                logger.error(f"Error status {response.status} for page {page}")
                 return None
         except Exception as e:
-            logger.error(f"Error requesting page {params.get('page')}: {str(e)}")
+            logger.error(f"Error requesting page {page}: {e}")
             return None
 
-
-    @staticmethod
-    async def get_vacancies() -> AsyncGenerator[Dict[str, Dict], None]:
+    async def get_vacancies(self) -> AsyncGenerator[Dict[str, Dict], None]:
         """Асинхронный генератор вакансий"""
         async with ClientSession() as session:
-            for page in range(1):
-                params = ZarplataParser.BASE_PARAMS.copy()
-                params['page'] = page
-
-                html = await ZarplataParser.fetch_page(session, 'https://berdsk.zarplata.ru/search/vacancy', params)
+            for page in range(self.pages):
+                html = await self.fetch_page(session, page)
                 if not html:
-                    logger.info("HTML is None")
                     continue
 
-                vacancies = ZarplataParser.parse_page(html)
-
-                if vacancies:
-                    logger.info(f"Found {len(vacancies)} vacancies on page {page}")
-                    yield vacancies
-                else:
-                    logger.info(f"No vacancies found on page {page}")
-                    yield {}
+                vacancies = self.parse_page(html)
+                yield vacancies
                 await asyncio.sleep(1)  # Задержка между запросами
 
-    @staticmethod
-    def parse_page(html: str) -> Dict[str, Dict]:
+    def parse_page(self, html: str) -> Dict[str, Dict]:
         """Парсит HTML страницы и возвращает словарь вакансий"""
         soup = BeautifulSoup(html, "lxml")
-        items = soup.find_all('div', class_='magritte-redesign')
+
+        # Пробуем разные селекторы
+        selectors = [
+            'div[class*="magritte-redesign"]',
+            'div[data-qa="vacancy-serp__vacancy"]',
+            'div[class*="vacancy"]',
+        ]
+
+        items = []
+        for sel in selectors:
+            items = soup.select(sel)
+            if items:
+                logger.info(f"Found {len(items)} items with: {sel}")
+                break
+
+        if not items:
+            logger.warning("No vacancy items found")
+            return {}
 
         logger.info(f"Found {len(items)} items on the page")
 
@@ -137,7 +140,8 @@ class ZarplataParser:
 
 async def main():
     total_added = 0
-    async for vacancies in ZarplataParser.get_vacancies():
+    parser = ZarplataParser(pages=1)
+    async for vacancies in parser.get_vacancies():
         logger.info(f"Processing vacancies: {vacancies}")
         hasher = Hash_Vacancy(vacancies)
         added = hasher.process()

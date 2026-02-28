@@ -1,12 +1,13 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pandas as pd
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (InlineKeyboardButton, KeyboardButton, Message,
                            ReplyKeyboardMarkup, InlineKeyboardMarkup)
@@ -14,7 +15,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv, find_dotenv
 
 import hh_ru
-import re
 
 # Настройка логирования
 logging.basicConfig(
@@ -28,11 +28,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 load_dotenv(find_dotenv('.env'))
-bot = Bot(os.getenv("TOKEN"))
-dp = Dispatcher()
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise ValueError("TOKEN not found in .env file")
 
-# Кеш для хранения последних вакансий
-vacancies_cache: Dict[int, Dict] = {}
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
 
 
 # Инициализация SQLite
@@ -61,25 +62,6 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True
     )
-
-
-def get_pagination_keyboard(page: int, total_pages: int, prefix: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    if page > 1:
-        builder.add(InlineKeyboardButton(
-            text="⬅️ Назад",
-            callback_data=f"{prefix}_prev_{page - 1}"
-        ))
-    builder.add(InlineKeyboardButton(
-        text=f"{page}/{total_pages}",
-        callback_data="current_page"
-    ))
-    if page < total_pages:
-        builder.add(InlineKeyboardButton(
-            text="Вперёд ➡️",
-            callback_data=f"{prefix}_next_{page + 1}"
-        ))
-    return builder.as_markup()
 
 
 def format_vacancy(vacancies_dict: Dict) -> str:
@@ -131,7 +113,7 @@ def format_vacancy(vacancies_dict: Dict) -> str:
     return "\n".join(result) if result else "Нет вакансий для отображения"
 
 
-async def get_user_filters(user_id: int) -> List[str]:
+def get_user_filters(user_id: int) -> List[str]:
     with sqlite3.connect('vacancy_bot.db') as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -142,7 +124,7 @@ async def get_user_filters(user_id: int) -> List[str]:
     return [f.strip().lower() for f in result[0].split(',')] if result and result[0] else []
 
 
-async def filter_vacancies(vacancies: Dict, filters: List[str]) -> Dict:
+def filter_vacancies(vacancies: Dict, filters: List[str]) -> Dict:
     if not filters:
         return vacancies
 
@@ -209,8 +191,8 @@ async def send_latest_vacancies(message: Message):
             await message.answer("Новых вакансий не найдено.")
             return
 
-        filters = await get_user_filters(user_id)
-        filtered_vacancies = await filter_vacancies(new_vacancies, filters)
+        filters = get_user_filters(user_id)
+        filtered_vacancies = filter_vacancies(new_vacancies, filters)
 
         formatted = format_vacancy(filtered_vacancies)
         await message.answer(formatted if formatted else "Нет вакансий по вашему фильтру.")
@@ -286,7 +268,7 @@ async def check_new_vacancies():
             for user_id, filters in subscribers:
                 try:
                     filters_list = [f.strip().lower() for f in filters.split(',')] if filters else []
-                    filtered = await filter_vacancies(new_vacancies, filters_list)
+                    filtered = filter_vacancies(new_vacancies, filters_list)
 
                     if filtered:
                         await bot.send_message(
